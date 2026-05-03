@@ -28,6 +28,7 @@ import (
 	"ds2api/internal/httpapi/openai/responses"
 	"ds2api/internal/httpapi/openai/shared"
 	"ds2api/internal/httpapi/requestbody"
+	"ds2api/internal/sessions"
 	"ds2api/internal/webui"
 )
 
@@ -55,6 +56,36 @@ func NewApp() (*App, error) {
 	} else {
 		config.Logger.Info("[PoW] pure Go solver ready")
 	}
+
+	sessions.InitManager(pool, resolver, dsClient)
+
+	// Async startup routine to clear old DeepSeek sessions for all accounts to prevent spam/lag
+	go func() {
+		config.Logger.Info("[startup] begin background cleanup of all old DeepSeek sessions...")
+		for _, acc := range store.Accounts() {
+			token := acc.Token
+			if token == "" {
+				var loginErr error
+				token, loginErr = dsClient.Login(context.Background(), acc)
+				if loginErr != nil {
+					config.Logger.Warn("[startup] skip session cleanup for account, login failed", "account", acc.Identifier(), "error", loginErr)
+					continue
+				}
+			}
+			if token != "" {
+				delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				err := dsClient.DeleteAllSessionsForToken(delCtx, token)
+				cancel()
+				if err != nil {
+					config.Logger.Warn("[startup] failed to clean old sessions", "account", acc.Identifier(), "error", err)
+				} else {
+					config.Logger.Info("[startup] successfully cleaned old sessions", "account", acc.Identifier())
+				}
+			}
+		}
+		config.Logger.Info("[startup] finished background cleanup of all old DeepSeek sessions.")
+	}()
+
 	chatHistoryStore := chathistory.New(config.ChatHistoryPath())
 	if err := chatHistoryStore.Err(); err != nil {
 		config.Logger.Warn("[chat_history] unavailable", "path", chatHistoryStore.Path(), "error", err)
@@ -174,6 +205,7 @@ var defaultCORSAllowHeaders = []string{
 	"X-Ds2-Source",
 	"X-Vercel-Protection-Bypass",
 	"X-Goog-Api-Key",
+	"X-Chat-Session-ID",
 	"Anthropic-Version",
 	"Anthropic-Beta",
 }

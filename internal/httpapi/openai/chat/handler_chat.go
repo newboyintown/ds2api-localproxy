@@ -17,6 +17,7 @@ import (
 	"ds2api/internal/promptcompat"
 	"ds2api/internal/sse"
 	streamengine "ds2api/internal/stream"
+	"ds2api/internal/sessions"
 )
 
 func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +34,84 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a, err := h.Auth.Determine(r)
+	clientSessionID := strings.TrimSpace(r.Header.Get("X-Chat-Session-ID"))
+	isStateful := clientSessionID != ""
+
+	var a *auth.RequestAuth
+	var err error
+	var sessionState *sessions.SessionState
+	var statefulDsSessionID string
+
+	if isStateful && sessions.GlobalManager() != nil {
+		sessionState = sessions.GlobalManager().GetSession(clientSessionID)
+		sessionState.Lock()
+		defer sessionState.Unlock()
+
+		// 1. Try to acquire the same account if we already have a session
+		dummyReq := r.Clone(r.Context())
+		if sessionState.AccountID != "" {
+			dummyReq.Header.Set("X-Ds2-Target-Account", sessionState.AccountID)
+		}
+
+		a, err = h.Auth.Determine(dummyReq)
+		if err != nil && sessionState.AccountID != "" {
+			// Fallback: the bound account is busy or failed, acquire any account
+			dummyReq.Header.Del("X-Ds2-Target-Account")
+			a, err = h.Auth.Determine(dummyReq)
+			// We lost the session because we switched accounts
+			sessionState.DeepSeekSessionID = ""
+			sessionState.AccountID = ""
+			sessionState.DeepSeekToken = ""
+			sessionState.TurnCount = 0
+		}
+
+		if err == nil {
+			// Check rotation
+			if sessionState.DeepSeekSessionID != "" && sessionState.TurnCount >= sessions.TurnLimit {
+				// We need a NEW slot for rotation to avoid deadlocking if the current slot is the only one available
+				dummyReqNew := r.Clone(r.Context())
+				dummyReqNew.Header.Del("X-Ds2-Target-Account")
+
+				// Attempt to acquire a new slot
+				var newA *auth.RequestAuth
+				maxAccountRetries := 5
+				for i := 0; i < maxAccountRetries; i++ {
+					newA, err = h.Auth.Determine(dummyReqNew)
+					if err == nil {
+						break
+					}
+					time.Sleep(1 * time.Second)
+				}
+
+				if newA != nil {
+					rotErr := sessions.GlobalManager().RotateAndSummarizeLocked(r.Context(), sessionState, a, newA)
+					if rotErr != nil {
+						config.Logger.Warn("[sessions] rotation failed", "error", rotErr)
+						h.Auth.Release(newA)
+						sessionState.DeepSeekSessionID = ""
+						sessionState.AccountID = ""
+						sessionState.DeepSeekToken = ""
+						sessionState.TurnCount = 0
+					} else {
+						// Rotation succeeded. Release the OLD slot and use the NEW slot.
+						h.Auth.Release(a)
+						a = newA
+					}
+				} else {
+					config.Logger.Warn("[sessions] rotation failed to acquire new account")
+					// Drop session and start fresh
+					sessionState.DeepSeekSessionID = ""
+					sessionState.AccountID = ""
+					sessionState.DeepSeekToken = ""
+					sessionState.TurnCount = 0
+				}
+			}
+			statefulDsSessionID = sessionState.DeepSeekSessionID
+		}
+	} else {
+		a, err = h.Auth.Determine(r)
+	}
+
 	if err != nil {
 		status := http.StatusUnauthorized
 		detail := err.Error()
@@ -43,9 +121,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, status, detail)
 		return
 	}
+
 	var sessionID string
 	defer func() {
-		h.autoDeleteRemoteSession(r.Context(), a, sessionID)
+		if !isStateful {
+			h.autoDeleteRemoteSession(r.Context(), a, sessionID)
+		}
 		h.Auth.Release(a)
 	}()
 
@@ -70,6 +151,15 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	if isStateful && sessionState != nil && statefulDsSessionID != "" {
+		latestMsg := sessions.ExtractLatestUserMessage(stdReq.Messages)
+		if latestMsg != "" {
+			stdReq.FinalPrompt = latestMsg
+			stdReq.PromptTokenText = latestMsg
+		}
+	}
+
 	stdReq, err = h.applyCurrentInputFile(r.Context(), a, stdReq)
 	if err != nil {
 		status, message := mapCurrentInputFileError(err)
@@ -79,11 +169,36 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	historySession := startChatHistory(h.ChatHistory, r, a, stdReq)
 
 	if !stdReq.Stream {
-		result, outErr := completionruntime.ExecuteNonStreamWithRetry(r.Context(), h.DS, a, stdReq, completionruntime.Options{
-			StripReferenceMarkers: stripReferenceMarkersEnabled(),
-			RetryEnabled:          true,
-			CurrentInputFile:      h.Store,
-		})
+		var result completionruntime.NonStreamResult
+		var outErr *assistantturn.OutputError
+
+		if isStateful && statefulDsSessionID != "" {
+			opts := completionruntime.Options{
+				StripReferenceMarkers: stripReferenceMarkersEnabled(),
+				RetryEnabled:          true,
+				CurrentInputFile:      h.Store,
+			}
+			payload := stdReq.CompletionPayload(statefulDsSessionID)
+			pow, getPowErr := h.DS.GetPow(r.Context(), a, opts.MaxAttempts)
+			if getPowErr != nil {
+				writeOpenAIErrorWithCode(w, http.StatusUnauthorized, "Failed to get PoW", "error")
+				return
+			}
+			resp, callErr := h.DS.CallCompletion(r.Context(), a, payload, pow, opts.MaxAttempts)
+			if callErr != nil {
+				writeOpenAIErrorWithCode(w, http.StatusInternalServerError, "Failed to get completion", "error")
+				return
+			}
+			turn, attemptErr := completionruntime.CollectAttemptExp(resp, stdReq, stdReq.PromptTokenText, opts)
+			outErr = attemptErr
+			result = completionruntime.NonStreamResult{SessionID: statefulDsSessionID, Payload: payload, Turn: turn}
+		} else {
+			result, outErr = completionruntime.ExecuteNonStreamWithRetry(r.Context(), h.DS, a, stdReq, completionruntime.Options{
+				StripReferenceMarkers: stripReferenceMarkersEnabled(),
+				RetryEnabled:          true,
+				CurrentInputFile:      h.Store,
+			})
+		}
 		sessionID = result.SessionID
 		if outErr != nil {
 			if historySession != nil {
@@ -99,12 +214,32 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			historySession.success(http.StatusOK, result.Turn.Thinking, result.Turn.Text, finishReason, assistantturn.OpenAIChatUsage(result.Turn))
 		}
 		writeJSON(w, http.StatusOK, respBody)
+		if isStateful && sessionState != nil {
+			sessionState.DeepSeekSessionID = sessionID
+			sessionState.AccountID = a.AccountID
+			sessionState.DeepSeekToken = a.DeepSeekToken
+			sessionState.TurnCount++
+		}
 		return
 	}
 
-	start, outErr := completionruntime.StartCompletion(r.Context(), h.DS, a, stdReq, completionruntime.Options{
-		CurrentInputFile: h.Store,
-	})
+	var start completionruntime.StartResult
+	var outErr *assistantturn.OutputError
+	opts := completionruntime.Options{CurrentInputFile: h.Store}
+
+	if isStateful && statefulDsSessionID != "" {
+		payload := stdReq.CompletionPayload(statefulDsSessionID)
+		pow, _ := h.DS.GetPow(r.Context(), a, opts.MaxAttempts)
+		resp, callErr := h.DS.CallCompletion(r.Context(), a, payload, pow, opts.MaxAttempts)
+		if callErr != nil {
+			outErr = &assistantturn.OutputError{Status: http.StatusInternalServerError, Message: "Failed to get completion.", Code: "error"}
+		} else {
+			start = completionruntime.StartResult{SessionID: statefulDsSessionID, Payload: payload, Pow: pow, Response: resp, Request: stdReq}
+		}
+	} else {
+		start, outErr = completionruntime.StartCompletion(r.Context(), h.DS, a, stdReq, opts)
+	}
+
 	sessionID = start.SessionID
 	if outErr != nil {
 		if historySession != nil {
@@ -116,8 +251,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	streamReq := start.Request
 	refFileTokens := streamReq.RefFileTokens
 	h.handleStreamWithRetry(w, r, a, start.Response, start.Payload, start.Pow, sessionID, streamReq.ResponseModel, streamReq.PromptTokenText, refFileTokens, streamReq.Thinking, streamReq.Search, streamReq.ToolNames, streamReq.ToolsRaw, streamReq.ToolChoice, historySession)
-}
 
+	if isStateful && sessionState != nil {
+		sessionState.DeepSeekSessionID = sessionID
+		sessionState.AccountID = a.AccountID
+		sessionState.DeepSeekToken = a.DeepSeekToken
+		sessionState.TurnCount++
+	}
+}
 func (h *Handler) autoDeleteRemoteSession(ctx context.Context, a *auth.RequestAuth, sessionID string) {
 	mode := h.Store.AutoDeleteMode()
 	if mode == "none" || a.DeepSeekToken == "" {
