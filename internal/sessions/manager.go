@@ -1,11 +1,12 @@
 package sessions
 
 import (
+	"context"
 	"sync"
 	"time"
 
 	"ds2api/internal/account"
-	"ds2api/internal/auth"
+
 	"ds2api/internal/httpapi/openai/shared"
 )
 
@@ -15,8 +16,8 @@ type SessionState struct {
 	ClientSessionID   string
 	DeepSeekSessionID string
 	AccountID         string
+	DeepSeekToken     string
 	TurnCount         int
-	Auth              *auth.RequestAuth
 	LastUsed          time.Time
 	mu                sync.Mutex
 }
@@ -31,24 +32,6 @@ type Manager struct {
 
 var globalManager *Manager
 
-
-func (m *Manager) startCleanupRoutine() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			m.mu.Lock()
-			now := time.Now()
-			for id, session := range m.sessions {
-				if now.Sub(session.LastUsed) > 2*time.Hour {
-					delete(m.sessions, id)
-				}
-			}
-			m.mu.Unlock()
-		}
-	}()
-}
-
 func InitManager(pool *account.Pool, authResolver shared.AuthResolver, ds shared.DeepSeekCaller) {
 	globalManager = &Manager{
 		sessions: make(map[string]*SessionState),
@@ -61,6 +44,28 @@ func InitManager(pool *account.Pool, authResolver shared.AuthResolver, ds shared
 
 func GlobalManager() *Manager {
 	return globalManager
+}
+
+func (m *Manager) startCleanupRoutine() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			m.mu.Lock()
+			now := time.Now()
+			for id, session := range m.sessions {
+				if now.Sub(session.LastUsed) > 2*time.Hour {
+					if session.DeepSeekSessionID != "" && session.DeepSeekToken != "" {
+						delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						_, _ = m.ds.DeleteSessionForToken(delCtx, session.DeepSeekToken, session.DeepSeekSessionID)
+						cancel()
+					}
+					delete(m.sessions, id)
+				}
+			}
+			m.mu.Unlock()
+		}
+	}()
 }
 
 func (m *Manager) GetSession(clientSessionID string) *SessionState {
@@ -84,12 +89,10 @@ func (m *Manager) RemoveSession(clientSessionID string) {
 	delete(m.sessions, clientSessionID)
 }
 
-// Lock blocks until the session lock is acquired.
 func (s *SessionState) Lock() {
 	s.mu.Lock()
 }
 
-// Unlock releases the session lock.
 func (s *SessionState) Unlock() {
 	s.mu.Unlock()
 }

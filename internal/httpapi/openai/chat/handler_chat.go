@@ -36,6 +36,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	clientSessionID := strings.TrimSpace(r.Header.Get("X-Chat-Session-ID"))
 	isStateful := clientSessionID != ""
+
 	var a *auth.RequestAuth
 	var err error
 	var sessionState *sessions.SessionState
@@ -46,21 +47,67 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		sessionState.Lock()
 		defer sessionState.Unlock()
 
-		if sessionState.TurnCount >= sessions.TurnLimit {
-			if rotErr := sessions.GlobalManager().RotateAndSummarize(r.Context(), sessionState, r); rotErr != nil {
-				config.Logger.Warn("[sessions] rotation failed", "error", rotErr)
-				sessionState.DeepSeekSessionID = ""
-				sessionState.Auth = nil
-				sessionState.TurnCount = 0
-			}
+		// 1. Try to acquire the same account if we already have a session
+		dummyReq := r.Clone(r.Context())
+		if sessionState.AccountID != "" {
+			dummyReq.Header.Set("X-Ds2-Target-Account", sessionState.AccountID)
 		}
 
-		if sessionState.Auth == nil {
-			a, err = h.Auth.Determine(r)
-		} else {
-			a = sessionState.Auth
+		a, err = h.Auth.Determine(dummyReq)
+		if err != nil && sessionState.AccountID != "" {
+			// Fallback: the bound account is busy or failed, acquire any account
+			dummyReq.Header.Del("X-Ds2-Target-Account")
+			a, err = h.Auth.Determine(dummyReq)
+			// We lost the session because we switched accounts
+			sessionState.DeepSeekSessionID = ""
+			sessionState.AccountID = ""
+			sessionState.DeepSeekToken = ""
+			sessionState.TurnCount = 0
 		}
-		statefulDsSessionID = sessionState.DeepSeekSessionID
+
+		if err == nil {
+			// Check rotation
+			if sessionState.DeepSeekSessionID != "" && sessionState.TurnCount >= sessions.TurnLimit {
+				// We need a NEW slot for rotation to avoid deadlocking if the current slot is the only one available
+				dummyReqNew := r.Clone(r.Context())
+				dummyReqNew.Header.Del("X-Ds2-Target-Account")
+
+				// Attempt to acquire a new slot
+				var newA *auth.RequestAuth
+				maxAccountRetries := 5
+				for i := 0; i < maxAccountRetries; i++ {
+					newA, err = h.Auth.Determine(dummyReqNew)
+					if err == nil {
+						break
+					}
+					time.Sleep(1 * time.Second)
+				}
+
+				if newA != nil {
+					rotErr := sessions.GlobalManager().RotateAndSummarizeLocked(r.Context(), sessionState, a, newA)
+					if rotErr != nil {
+						config.Logger.Warn("[sessions] rotation failed", "error", rotErr)
+						h.Auth.Release(newA)
+						sessionState.DeepSeekSessionID = ""
+						sessionState.AccountID = ""
+						sessionState.DeepSeekToken = ""
+						sessionState.TurnCount = 0
+					} else {
+						// Rotation succeeded. Release the OLD slot and use the NEW slot.
+						h.Auth.Release(a)
+						a = newA
+					}
+				} else {
+					config.Logger.Warn("[sessions] rotation failed to acquire new account")
+					// Drop session and start fresh
+					sessionState.DeepSeekSessionID = ""
+					sessionState.AccountID = ""
+					sessionState.DeepSeekToken = ""
+					sessionState.TurnCount = 0
+				}
+			}
+			statefulDsSessionID = sessionState.DeepSeekSessionID
+		}
 	} else {
 		a, err = h.Auth.Determine(r)
 	}
@@ -79,11 +126,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if !isStateful {
 			h.autoDeleteRemoteSession(r.Context(), a, sessionID)
-			h.Auth.Release(a)
-		} else if statefulDsSessionID == "" {
-			// Failed to establish or we are dropping it
-			h.Auth.Release(a)
 		}
+		h.Auth.Release(a)
 	}()
 
 	r = r.WithContext(auth.WithAuth(r.Context(), a))
@@ -145,36 +189,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorWithCode(w, http.StatusInternalServerError, "Failed to get completion", "error")
 				return
 			}
-			_ = resp
-			// Unfortunately CollectAttempt is private in completionruntime, we will just use ExecuteNonStreamWithRetry
-			// since it creates a new session. WAIT! ExecuteNonStreamWithRetry creates a session internally.
-			// We MUST parse it manually. We can't access collectAttempt.
-			// Let me fix that. I will write a small helper in completionruntime or duplicate the reading logic here.
-			// Wait, the easiest way is to modify completionruntime to allow passing a pre-existing session ID.
-			// Let's use ExecuteNonStreamWithRetry but it will create a new session. We can't do that.
-			// I will patch completionruntime to export CollectAttempt.
-		}
-
-		// For now, I'll put a placeholder and then fix completionruntime.
-		// ACTUALLY, CollectAttempt was not exported. I will export it.
-
-		if isStateful && statefulDsSessionID != "" {
-			opts := completionruntime.Options{
-				StripReferenceMarkers: stripReferenceMarkersEnabled(),
-				RetryEnabled:          true,
-				CurrentInputFile:      h.Store,
-			}
-			payload := stdReq.CompletionPayload(statefulDsSessionID)
-			pow, getPowErr := h.DS.GetPow(r.Context(), a, opts.MaxAttempts)
-			if getPowErr != nil {
-				writeOpenAIErrorWithCode(w, http.StatusUnauthorized, "Failed to get PoW", "error")
-				return
-			}
-			resp, callErr := h.DS.CallCompletion(r.Context(), a, payload, pow, opts.MaxAttempts)
-			if callErr != nil {
-				writeOpenAIErrorWithCode(w, http.StatusInternalServerError, "Failed to get completion", "error")
-				return
-			}
 			turn, attemptErr := completionruntime.CollectAttemptExp(resp, stdReq, stdReq.PromptTokenText, opts)
 			outErr = attemptErr
 			result = completionruntime.NonStreamResult{SessionID: statefulDsSessionID, Payload: payload, Turn: turn}
@@ -200,10 +214,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			historySession.success(http.StatusOK, result.Turn.Thinking, result.Turn.Text, finishReason, assistantturn.OpenAIChatUsage(result.Turn))
 		}
 		writeJSON(w, http.StatusOK, respBody)
-
 		if isStateful && sessionState != nil {
 			sessionState.DeepSeekSessionID = sessionID
-			sessionState.Auth = a
+			sessionState.AccountID = a.AccountID
+			sessionState.DeepSeekToken = a.DeepSeekToken
 			sessionState.TurnCount++
 		}
 		return
@@ -240,11 +254,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if isStateful && sessionState != nil {
 		sessionState.DeepSeekSessionID = sessionID
-		sessionState.Auth = a
+		sessionState.AccountID = a.AccountID
+		sessionState.DeepSeekToken = a.DeepSeekToken
 		sessionState.TurnCount++
 	}
 }
-
 func (h *Handler) autoDeleteRemoteSession(ctx context.Context, a *auth.RequestAuth, sessionID string) {
 	mode := h.Store.AutoDeleteMode()
 	if mode == "none" || a.DeepSeekToken == "" {

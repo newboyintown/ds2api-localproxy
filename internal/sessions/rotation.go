@@ -13,16 +13,15 @@ import (
 	"ds2api/internal/sse"
 )
 
-// RotateAndSummarize rotates the current session by asking for a summary,
-// acquiring a new account slot, creating a new session, and deleting the old one.
-func (m *Manager) RotateAndSummarize(ctx context.Context, state *SessionState, req *http.Request) error {
-	if state.DeepSeekSessionID == "" || state.Auth == nil {
+// RotateAndSummarizeLocked rotates the current session using the provided active RequestAuth slots.
+func (m *Manager) RotateAndSummarizeLocked(ctx context.Context, state *SessionState, oldA *auth.RequestAuth, newA *auth.RequestAuth) error {
+	if state.DeepSeekSessionID == "" {
 		return fmt.Errorf("no active session to rotate")
 	}
 
 	config.Logger.Info("[sessions] starting rotation", "client_session_id", state.ClientSessionID, "old_ds_session_id", state.DeepSeekSessionID, "account_id", state.AccountID)
 
-	// 1. Send summary request
+	// 1. Send summary request to OLD session
 	summaryPrompt := "Hãy tóm tắt lại các key ở trên, và đặc biệt là vấn đề hiện tại đang nói tới."
 	payload := map[string]any{
 		"chat_session_id":   state.DeepSeekSessionID,
@@ -33,12 +32,12 @@ func (m *Manager) RotateAndSummarize(ctx context.Context, state *SessionState, r
 		"search_enabled":    false,
 	}
 
-	pow, err := m.ds.GetPow(ctx, state.Auth, 3)
+	pow, err := m.ds.GetPow(ctx, oldA, 3)
 	if err != nil {
 		return fmt.Errorf("failed to get PoW for summary: %w", err)
 	}
 
-	resp, err := m.ds.CallCompletion(ctx, state.Auth, payload, pow, 3)
+	resp, err := m.ds.CallCompletion(ctx, oldA, payload, pow, 3)
 	if err != nil {
 		return fmt.Errorf("failed to get summary completion: %w", err)
 	}
@@ -57,37 +56,15 @@ func (m *Manager) RotateAndSummarize(ctx context.Context, state *SessionState, r
 
 	config.Logger.Info("[sessions] obtained summary", "client_session_id", state.ClientSessionID)
 
-	// 2. Acquire new account and create new session
-	var newAuth *auth.RequestAuth
-	var newDsSessionID string
-
-	dummyReq := req.Clone(ctx)
-	dummyReq.Header.Del("X-Ds2-Target-Account")
-
-	maxAccountRetries := 5
-	for i := 0; i < maxAccountRetries; i++ {
-		a, err := m.auth.Determine(dummyReq)
-		if err != nil {
-			return fmt.Errorf("failed to acquire new account for rotation: %w", err)
-		}
-
-		newSessionID, err := m.ds.CreateSession(ctx, a, 3)
-		if err != nil {
-			m.auth.Release(a)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		newAuth = a
-		newDsSessionID = newSessionID
-		break
-	}
-	if newAuth == nil {
-	    return fmt.Errorf("failed to acquire new account for rotation after retries")
+	// 2. Create new session on NEW account
+	newDsSessionID, err := m.ds.CreateSession(ctx, newA, 3)
+	if err != nil {
+		return fmt.Errorf("failed to create new session: %w", err)
 	}
 
-	config.Logger.Info("[sessions] acquired new session", "client_session_id", state.ClientSessionID, "new_ds_session_id", newDsSessionID, "new_account_id", newAuth.AccountID)
+	config.Logger.Info("[sessions] acquired new session", "client_session_id", state.ClientSessionID, "new_ds_session_id", newDsSessionID, "new_account_id", newA.AccountID)
 
-	// 3. Send summary to new session
+	// 3. Send summary context to NEW session
 	injectionPrompt := "Đây là tóm tắt nội dung chat trước đó để tiếp tục context:\n\n" + summaryText + "\n\nHãy sẵn sàng để trả lời câu hỏi tiếp theo dựa trên ngữ cảnh này."
 	injPayload := map[string]any{
 		"chat_session_id":   newDsSessionID,
@@ -98,9 +75,9 @@ func (m *Manager) RotateAndSummarize(ctx context.Context, state *SessionState, r
 		"search_enabled":    false,
 	}
 
-	powInj, err := m.ds.GetPow(ctx, newAuth, 3)
+	powInj, err := m.ds.GetPow(ctx, newA, 3)
 	if err == nil {
-		respInj, errInj := m.ds.CallCompletion(ctx, newAuth, injPayload, powInj, 3)
+		respInj, errInj := m.ds.CallCompletion(ctx, newA, injPayload, powInj, 3)
 		if errInj == nil {
 			_ = sse.CollectStream(respInj, false, true)
 			respInj.Body.Close()
@@ -109,21 +86,21 @@ func (m *Manager) RotateAndSummarize(ctx context.Context, state *SessionState, r
 
 	config.Logger.Info("[sessions] injected summary to new session", "client_session_id", state.ClientSessionID)
 
-	// 4. Delete old session
-	oldAuth := state.Auth
+	// 4. Delete old session asynchronously
+	oldToken := oldA.DeepSeekToken
 	oldSessionID := state.DeepSeekSessionID
 	go func() {
 		delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = m.ds.DeleteSessionForToken(delCtx, oldAuth.DeepSeekToken, oldSessionID)
-		m.auth.Release(oldAuth) // release the old slot
+		_, _ = m.ds.DeleteSessionForToken(delCtx, oldToken, oldSessionID)
 	}()
 
-	// 5. Update state
+	// 5. Update internal state
 	state.DeepSeekSessionID = newDsSessionID
-	state.AccountID = newAuth.AccountID
-	state.Auth = newAuth
+	state.AccountID = newA.AccountID
+	state.DeepSeekToken = newA.DeepSeekToken
 	state.TurnCount = 0
+	state.LastUsed = time.Now()
 
 	config.Logger.Info("[sessions] rotation complete", "client_session_id", state.ClientSessionID)
 	return nil
