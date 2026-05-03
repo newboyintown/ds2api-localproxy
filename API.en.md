@@ -68,6 +68,19 @@ For Vercel one-click bootstrap, you can set only `DS2API_ADMIN_KEY` first, then 
 
 ## Authentication
 
+Clients should provide their token via the `Authorization: Bearer <token>` header.
+
+### Stateful Sessions (Optional)
+
+By default, the API behaves statelessly, meaning every `/v1/chat/completions` request concatenates all `messages` and opens a new short-lived upstream DeepSeek session.
+
+If you are building a continuous conversational client, you can pass the **`X-Chat-Session-ID: <unique-session-id>`** header. When provided:
+- DS2API securely bounds your custom ID to a long-lived upstream DeepSeek session.
+- DS2API optimizes context overhead by extracting only the **newest** user prompt from the payload (relying on the upstream session for memory).
+- After **25 conversation turns** (50 interactions), DS2API will automatically rotate the connection to a new pooled account, inject a summarized context to prevent hallucination or ban, and safely garbage-collect the old upstream session.
+
+### Account Routing
+
 ### Business Endpoints (`/v1/*`, `/anthropic/*`, `/v1beta/models/*`)
 
 Two header formats accepted:

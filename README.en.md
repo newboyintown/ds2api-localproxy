@@ -124,6 +124,7 @@ For the full module-by-module architecture and directory responsibilities, see [
 | Unified CORS compatibility | `/v1/*`, `/anthropic/*`, `/v1beta/models/*`, and `/admin/*` share one CORS policy; on Vercel, the Node Runtime for `/v1/chat/completions` mirrors the same relaxed preflight behavior for third-party clients |
 | Multi-account rotation | Auto token refresh, email/mobile dual login |
 | Concurrency control | Per-account in-flight limit + waiting queue, dynamic recommended concurrency |
+| Stateful Sessions | Optional continuous chat session tracking via `X-Chat-Session-ID` header. Re-uses upstream sessions, intelligently routes only the newest user prompt, rotates and summarizes the context automatically after 25 user turns, and prevents memory/storage lag via background/startup cleanup routines. |
 | DeepSeek PoW | Pure Go high-performance solver (DeepSeekHashV1), ms-level response |
 | Tool Calling | Anti-leak handling: non-code-block feature match, early `delta.tool_calls`, structured incremental output |
 | Admin API | Config management, runtime settings hot-reload, proxy management, account testing/batch test, session cleanup, import/export, Vercel sync, version check |
