@@ -191,3 +191,8 @@ func authOutputError(a *auth.RequestAuth) *assistantturn.OutputError {
 func Errorf(status int, format string, args ...any) *assistantturn.OutputError {
 	return &assistantturn.OutputError{Status: status, Message: fmt.Sprintf(format, args...), Code: "error"}
 }
+
+// CollectAttemptExp exposes collectAttempt for external session management
+func CollectAttemptExp(resp *http.Response, stdReq promptcompat.StandardRequest, usagePrompt string, opts Options) (assistantturn.Turn, *assistantturn.OutputError) {
+	return collectAttempt(resp, stdReq, usagePrompt, opts)
+}
